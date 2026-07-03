@@ -1,0 +1,12 @@
+# Normandy EDI - Gitignore
+node_modules/
+.env
+*.log
+*.db
+*.apk
+.DS_Store
+*.swp
+*.swo
+*~
+rish_shizuku.dex
+rish

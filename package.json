@@ -1,0 +1,14 @@
+{
+  "name": "normandy-edi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "EDI - Enhanced Defense Intelligence for Android phone. Proactive AI assistant with MCP architecture.",
+  "type": "module",
+  "scripts": {
+    "edi:start": "node src/proximity-mcp-server.js",
+    "edi:loop": "bash src/edi-loop.sh",
+    "wifi:start": "node src/wifi-mcp-server.js",
+    "bt:start": "node src/bluetooth-mcp-server.js"
+  },
+  "keywords": ["edi", "mass-effect", "mcp", "ai-assistant", "android", "termux"]
+}
