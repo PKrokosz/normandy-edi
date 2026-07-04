@@ -11,7 +11,11 @@ function termuxJson(cmd, timeout = 8000) {
 
 function shizuku(cmd) {
   if (!RISH) return null;
-  try { return execSync(`${RISH} -c '${cmd.replace(/'/g, "'\\''")}'`, { encoding: "utf8", timeout: 10000 }).trim(); } catch { return null; }
+  try {
+    const out = execSync(`${RISH} -c '${cmd.replace(/'/g, "'\\''")}'`, { encoding: "utf8", timeout: 10000 }).trim();
+    if (out.startsWith("Unknown") || out.startsWith("Error") || out.includes("exception")) return null;
+    return out;
+  } catch { return null; }
 }
 
 function speak(text) {
@@ -19,12 +23,25 @@ function speak(text) {
 }
 
 function notify(title, text) {
-  try { execSync(`termux-notification -t ${JSON.stringify(title)} -c ${JSON.stringify(text)}`, { encoding: "utf8", timeout: 3000 }); } catch {}
+  try { execSync(`termux-notification -t ${JSON.stringify(title)} -c ${JSON.stringify(text)} --priority high`, { encoding: "utf8", timeout: 3000 }); } catch {}
+}
+
+function playSound(file) {
+  try { execSync(`termux-media-player play ${JSON.stringify(file)} 2>/dev/null`, { encoding: "utf8", timeout: 5000 }); } catch {}
 }
 
 let triggers = [];
-let state = { wifi: { connected: null, visible: [] }, bt: { enabled: false, paired: [] }, location: null, battery: null };
+let state = {
+  wifi: { connected: null, visible: [] },
+  bt: { enabled: false, paired: [] },
+  location: null,
+  battery: null,
+  calendar: [],
+  last_news: [],
+  notifications: []
+};
 let monitorInterval = null;
+let heavyScanCounter = 0;
 
 function scanWifi() {
   const conn = termuxJson("termux-wifi-connectioninfo", 5000);
@@ -44,9 +61,12 @@ function checkBt() {
     const s = execSync("settings get global bluetooth_on 2>/dev/null", { timeout: 2000, encoding: "utf8" }).trim();
     state.bt.enabled = s === "1";
   } catch { state.bt.enabled = false; }
+  state.bt.paired = [];
   if (RISH) {
-    const res = shizuku("cmd bluetooth_manager get-paired-devices");
-    if (res) state.bt.paired = res.split("\n").filter(Boolean);
+    try {
+      const res = shizuku("dumpsys bluetooth_manager | grep -i 'name:' | head -5");
+      if (res) state.bt.paired = res.split("\n").filter(Boolean);
+    } catch {}
   }
 }
 
@@ -60,14 +80,116 @@ function checkBattery() {
   if (bat && !bat.error) state.battery = bat;
 }
 
+function checkCalendar() {
+  try {
+    const raw = execSync("termux-calendar-list -n 5 2>/dev/null", { encoding: "utf8", timeout: 8000 }).trim();
+    if (!raw || raw === "[]" || raw.startsWith("Usage") || raw.startsWith("Error")) return;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      state.calendar = parsed.map(e => ({
+        title: e.title || "(no title)",
+        begin: e.begin || e.start || "?",
+        end: e.end || "?",
+        location: e.eventLocation || e.location || "",
+        allDay: e.allDay || false
+      }));
+    }
+  } catch { state.calendar = []; }
+}
+
+function checkNews() {
+  const sources = [
+    { url: "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en", label: "Google News" },
+    { url: "https://news.google.com/rss?hl=pl&gl=PL&ceid=PL:pl", label: "Google News PL" }
+  ];
+  const headlines = [];
+  for (const src of sources) {
+    try {
+      const body = execSync(`curl -s --max-time 6 ${JSON.stringify(src.url)}`, { encoding: "utf8", timeout: 10000 });
+      const titles = [];
+      const regex = /<title>([^<]+)<\/title>/g;
+      let m;
+      while ((m = regex.exec(body)) !== null) {
+        if (m[1] !== "Google News" && m[1] !== "Google News" && !m[1].startsWith("Google News")) {
+          titles.push(m[1].replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'"));
+        }
+        if (titles.length >= 5) break;
+      }
+      if (titles.length) {
+        headlines.push({ source: src.label, titles });
+        break;
+      }
+    } catch {}
+  }
+  if (headlines.length) state.last_news = headlines;
+}
+
+function checkNotifications() {
+  try {
+    const res = shizuku("cmd notification list");
+    if (res) {
+      state.notifications = res.split("\n")
+        .filter(l => l.includes("NotificationRecord") || l.includes("key="))
+        .slice(0, 20)
+        .map(l => l.trim());
+    }
+  } catch {}
+}
+
+function getEnvironmentSnapshot() {
+  return {
+    wifi: {
+      connected: state.wifi.connected ? { ssid: state.wifi.connected.ssid, rssi: state.wifi.connected.rssi, ip: state.wifi.connected.ip } : null,
+      visible: state.wifi.visible.length,
+      open_networks: state.wifi.visible.filter(n => n.open && n.ssid !== "(hidden)").map(n => ({ ssid: n.ssid, rssi: n.rssi, freq: n.freq })),
+      scan_time: new Date().toISOString()
+    },
+    bluetooth: { enabled: state.bt.enabled, paired: state.bt.paired.length },
+    location: state.location ? { lat: state.location.latitude, lon: state.location.longitude, accuracy: state.location.accuracy } : null,
+    battery: state.battery ? { level: state.battery.percentage, status: state.battery.status, temp: state.battery.temperature } : null,
+    calendar: state.calendar.slice(0, 3),
+    headlines: state.last_news,
+    notifications: state.notifications.slice(0, 5)
+  };
+}
+
+function getOpenNetworks() {
+  return state.wifi.visible.filter(n => n.open && n.ssid && n.ssid !== "(hidden)");
+}
+
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function interpolate(msg, ctx) {
+  return msg.replace(/{(\w+)}/g, (_, k) => {
+    if (k === "ssid") return ctx.ssid || ctx.network?.ssid || ctx.strongest?.ssid || "?";
+    if (k === "rssi") return ctx.strongest?.rssi ?? ctx.network?.rssi ?? "?";
+    if (k === "count") return ctx.count ?? "?";
+    if (k === "level") return ctx.level ?? "?";
+    if (k === "zone") return ctx.zone || "?";
+    if (k === "device") return ctx.device || "?";
+    if (k === "distance") return ctx.distance_km?.toFixed(2) ?? "?";
+    if (k === "bssid") return ctx.network?.bssid || ctx.strongest?.bssid || "?";
+    if (k === "title") return ctx.event?.title || "?";
+    if (k === "time") return ctx.event?.begin || "?";
+    if (k === "headline") return ctx.headline || "?";
+    return k;
+  });
+}
+
 function evaluateTriggers() {
-  const openNets = state.wifi.visible.filter(n => n.open && n.ssid && n.ssid !== "(hidden)");
+  const openNets = getOpenNetworks();
   const currentSsid = state.wifi.connected?.ssid;
   const batLevel = state.battery?.percentage ?? -1;
   const isCharging = state.battery?.status === "CHARGING";
+  const now = Date.now();
 
   for (const t of triggers) {
-    if (t.lastFired && Date.now() - t.lastFired < (t.cooldown || 60000)) continue;
+    if (t.lastFired && now - t.lastFired < (t.cooldown || 60000)) continue;
     let fire = false; let ctx = {};
 
     switch (t.event) {
@@ -134,70 +256,95 @@ function evaluateTriggers() {
         t._wasCharging = isCharging;
         break;
       }
+      case "calendar_event": {
+        for (const ev of state.calendar) {
+          if (ev.begin && !ev._notified) {
+            const eventTime = new Date(ev.begin).getTime();
+            const leadMinutes = t.params?.lead_minutes || 30;
+            if (now >= eventTime - leadMinutes * 60000 && now < eventTime + 60000) {
+              fire = true; ctx = { event: ev };
+              ev._notified = true;
+              break;
+            }
+          }
+        }
+        break;
+      }
     }
 
     if (fire) {
-      t.lastFired = Date.now();
+      t.lastFired = now;
       const msg = interpolate(t.action?.message || "", ctx);
       const actionType = t.action?.type || "tts";
 
+      if (t.action?.sound_first) {
+        const soundFile = t.action.soundFile || `${HOME}/.config/opencode/sounds/intercom.wav`;
+        playSound(soundFile);
+      }
+
       switch (actionType) {
         case "tts": speak(msg); break;
-        case "notify": notify(t.action?.title || "Trigger", msg); break;
+        case "notify": notify(t.action?.title || "EDI", msg); break;
         case "toast": execSync(`termux-toast ${JSON.stringify(msg)}`, { timeout: 3000 }); break;
-        case "both": speak(msg); notify(t.action?.title || "Trigger", msg); break;
+        case "both": speak(msg); notify(t.action?.title || "EDI", msg); break;
+        case "chime": {
+          const soundFile = t.action.soundFile || `${HOME}/.config/opencode/sounds/intercom.wav`;
+          playSound(soundFile);
+          notify(t.action?.title || "EDI", msg);
+          break;
+        }
       }
     }
   }
 }
 
-function haversine(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
-  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
-  return 2*R*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-}
-
-function interpolate(msg, ctx) {
-  return msg.replace(/{(\w+)}/g, (_, k) => {
-    if (k === "ssid") return ctx.ssid || ctx.network?.ssid || ctx.strongest?.ssid || "?";
-    if (k === "rssi") return ctx.strongest?.rssi ?? ctx.network?.rssi ?? "?";
-    if (k === "count") return ctx.count ?? "?";
-    if (k === "level") return ctx.level ?? "?";
-    if (k === "zone") return ctx.zone || "?";
-    if (k === "device") return ctx.device || "?";
-    if (k === "distance") return ctx.distance_km?.toFixed(2) ?? "?";
-    if (k === "bssid") return ctx.network?.bssid || ctx.strongest?.bssid || "?";
-    return k;
-  });
+function startMonitor() {
+  scanWifi(); checkBt(); checkLocation(); checkBattery();
+  checkCalendar();
+  monitorInterval = setInterval(() => {
+    scanWifi(); checkBt();
+    if (triggers.some(t => t.event.startsWith("geo_"))) checkLocation();
+    if (triggers.some(t => t.event.startsWith("battery_"))) checkBattery();
+    if (triggers.some(t => t.event === "calendar_event")) checkCalendar();
+    heavyScanCounter++;
+    if (heavyScanCounter % 12 === 0) { // every ~3 minutes
+      checkCalendar();
+    }
+    if (heavyScanCounter % 30 === 0) { // every ~7.5 minutes
+      checkNews();
+    }
+    evaluateTriggers();
+  }, 15000);
 }
 
 const TOOLS = {
   add_trigger: {
-    description: "Create a context-aware trigger that monitors WiFi/BT/GPS/battery and speaks/acts",
+    description: "Create a context-aware trigger that monitors WiFi/BT/GPS/battery/calendar and speaks/acts",
     params: {
       id: { type: "string", description: "Unique name for this trigger" },
       event: {
         type: "string",
-        enum: ["open_wifi_seen", "specific_wifi_seen", "specific_wifi_lost", "wifi_connected", "wifi_disconnected", "bt_device_seen", "geo_enter", "geo_exit", "battery_low", "battery_charging"],
+        enum: ["open_wifi_seen", "specific_wifi_seen", "specific_wifi_lost", "wifi_connected", "wifi_disconnected", "bt_device_seen", "geo_enter", "geo_exit", "battery_low", "battery_charging", "calendar_event"],
         description: "What event to watch for"
       },
       params: {
         type: "object",
-        description: "Event-specific parameters (ssid, bssid, lat, lon, radius_km, threshold, min_rssi, name, device_name)",
+        description: "Event parameters (ssid, bssid, lat, lon, radius_km, threshold, min_rssi, name, device_name, lead_minutes)",
         optional: true
       },
       action: {
         type: "object",
         properties: {
-          type: { type: "string", enum: ["tts", "notify", "toast", "both"], default: "both" },
+          type: { type: "string", enum: ["tts", "notify", "toast", "both", "chime"], default: "notify" },
           title: { type: "string", description: "Notification title", optional: true },
-          message: { type: "string", description: "Message with {variables}: {ssid} {rssi} {count} {level} {zone} {device}" }
+          message: { type: "string", description: "Message with {ssid} {rssi} {count} {level} {zone} {device} {title} {time}" },
+          sound_first: { type: "boolean", default: false, description: "Play sound before message" },
+          soundFile: { type: "string", description: "Custom sound file path", optional: true }
         }
       },
-      cooldown: { type: "number", description: "Min seconds between fires (default 30)", optional: true }
+      cooldown: { type: "number", description: "Min seconds between fires (default 120)", optional: true }
     },
-    handler: async ({ id, event, params = {}, action, cooldown = 30 }) => {
+    handler: async ({ id, event, params = {}, action, cooldown = 120 }) => {
       const existing = triggers.findIndex(t => t.id === id);
       const trigger = { id, event, params, action, cooldown: cooldown * 1000, lastFired: 0 };
       if (existing >= 0) triggers[existing] = trigger;
@@ -217,32 +364,48 @@ const TOOLS = {
   },
   list_triggers: {
     description: "List all active triggers with their status",
-    handler: async () => {
-      return { result: triggers.map(t => ({
+    handler: async () => ({
+      result: triggers.map(t => ({
         id: t.id, event: t.event, params: t.params,
         action: t.action, lastFired: t.lastFired ? new Date(t.lastFired).toISOString() : null,
         cooldown_s: t.cooldown / 1000
-      })) };
-    }
+      }))
+    })
   },
   get_environment: {
     description: "Get current environment snapshot: WiFi, BT, location, battery",
     handler: async () => {
       scanWifi(); checkBt(); checkLocation(); checkBattery();
-      const openNets = state.wifi.visible.filter(n => n.open && n.ssid !== "(hidden)");
-      return {
-        result: {
-          wifi: {
-            connected: state.wifi.connected ? { ssid: state.wifi.connected.ssid, rssi: state.wifi.connected.rssi, ip: state.wifi.connected.ip } : null,
-            visible: state.wifi.visible.length,
-            open_networks: openNets.map(n => ({ ssid: n.ssid, rssi: n.rssi, freq: n.freq })),
-            scan_time: new Date().toISOString()
-          },
-          bluetooth: { enabled: state.bt.enabled, paired: state.bt.paired.length },
-          location: state.location ? { lat: state.location.latitude, lon: state.location.longitude, accuracy: state.location.accuracy } : null,
-          battery: state.battery ? { level: state.battery.percentage, status: state.battery.status, temp: state.battery.temperature } : null
-        }
-      };
+      return { result: getEnvironmentSnapshot() };
+    }
+  },
+  complete_scan: {
+    description: "Full scan: WiFi, BT, location, battery, calendar, headlines, notifications",
+    handler: async () => {
+      scanWifi(); checkBt(); checkLocation(); checkBattery();
+      checkCalendar(); checkNews(); checkNotifications();
+      return { result: getEnvironmentSnapshot() };
+    }
+  },
+  check_calendar: {
+    description: "Get upcoming calendar events",
+    handler: async () => {
+      checkCalendar();
+      return { result: { calendar: state.calendar.slice(0, 5) } };
+    }
+  },
+  check_news: {
+    description: "Fetch latest news headlines",
+    handler: async () => {
+      checkNews();
+      return { result: { headlines: state.last_news } };
+    }
+  },
+  check_notifications: {
+    description: "Get recent phone notifications",
+    handler: async () => {
+      checkNotifications();
+      return { result: { notifications: state.notifications.slice(0, 10) } };
     }
   },
   trigger_now: {
@@ -252,8 +415,12 @@ const TOOLS = {
       const t = triggers.find(t => t.id === id);
       if (!t) return { error: `Trigger "${id}" not found` };
       scanWifi(); checkBt(); checkLocation(); checkBattery();
-      t.lastFired = 0; // reset cooldown
+      t.lastFired = 0;
       const msg = override_message || t.action?.message || "Trigger fired";
+      if (t.action?.sound_first) {
+        const sf = t.action.soundFile || `${HOME}/.config/opencode/sounds/intercom.wav`;
+        playSound(sf);
+      }
       speak(msg);
       return { result: `Trigger "${id}" fired: "${msg}"` };
     }
@@ -262,18 +429,16 @@ const TOOLS = {
     description: "Make the phone speak any text through the speaker",
     params: { text: { type: "string" } },
     handler: async ({ text }) => { speak(text); return { result: "Speaking..." }; }
+  },
+  play_chime: {
+    description: "Play the Normandy intercom chime sound",
+    handler: async () => {
+      const sf = `${HOME}/.config/opencode/sounds/intercom.wav`;
+      playSound(sf);
+      return { result: "Chime played" };
+    }
   }
 };
-
-function startMonitor() {
-  scanWifi(); checkBt(); checkLocation(); checkBattery();
-  monitorInterval = setInterval(() => {
-    scanWifi(); checkBt();
-    if (triggers.some(t => t.event.startsWith("geo_"))) checkLocation();
-    if (triggers.some(t => t.event.startsWith("battery_"))) checkBattery();
-    evaluateTriggers();
-  }, 15000);
-}
 
 const server = createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -299,5 +464,5 @@ const server = createServer(async (req, res) => {
 const PORT = process.env.PORT || 3200;
 server.listen(PORT, "127.0.0.1", () => {
   console.error(`Proximity MCP on http://127.0.0.1:${PORT}/mcp`);
-  speak("Agent gotowy. Monitoruję otoczenie.");
+  console.error(`Tools: ${Object.keys(TOOLS).join(", ")}`);
 });
